@@ -1,0 +1,157 @@
+(import base)
+(import data :as d)
+(import error :as e)
+(import string :as s)
+
+; Widen character literals explicitly for u64 comparisons and arithmetic.
+(base:function char-code ((character u8)) u64
+  (base:convert character))
+
+(base:type result (product (status e:status) (offset u64)))
+
+; EOF is distinct from every possible input byte.
+(base:constant end-of-input u64 256)
+
+(base:function byte-at ((source d:view) (at u64)) u64
+  (match (< at (field source length))
+    (true (base:convert (deref (pointer-offset (field source bytes) at))))
+    (false end-of-input)))
+
+(base:function span ((source d:view) (start u64) (end u64)) d:view
+  (d:view (pointer-offset (field source bytes) start) (- end start)))
+
+(import allocator :as a)
+
+(base:type visitor
+  (product
+    (context (pointer void))
+    (emit (pointer (function ((pointer void) u64 u64 d:view) unit)))))
+
+; Field decoding uses one reusable buffer, released on every parse exit.
+(base:function field-at
+  ((source d:view) (at u64) (quoted bool) (closed bool) (buffer (pointer d:data))) result
+  (let ((c u64 (byte-at source at)))
+    (base:cond
+      (closed
+        (match
+          (base:or
+            (== c (char-code #\,))
+            (== c (char-code #\newline))
+            (== c (char-code #\return))
+            (== c end-of-input))
+          (true (result (e:success) at))
+          (false (result (e:invalid) at))))
+      (quoted
+        (base:cond
+          ((== c end-of-input) (result (e:invalid) at))
+          ((== c (char-code #\"))
+           (match (== (byte-at source (+ at 1)) (char-code #\"))
+             (true
+               (match (d:append buffer #\")
+                 ((ok) (field-at source (+ at 2) true false buffer))
+                 (reason (result reason at))))
+             (false (field-at source (+ at 1) false true buffer))))
+          (true
+            (match (d:append buffer (base:convert c))
+              ((ok) (field-at source (+ at 1) true false buffer))
+              (reason (result reason at))))))
+      ((base:or
+         (== c (char-code #\,))
+         (== c (char-code #\newline))
+         (== c (char-code #\return))
+         (== c end-of-input))
+       (result (e:success) at))
+      ((== c (char-code #\")) (result (e:invalid) at))
+      (true
+        (match (d:append buffer (base:convert c))
+          ((ok) (field-at source (+ at 1) false false buffer))
+          (reason (result reason at)))))))
+
+(base:function fields
+  ((source d:view) (at u64) (row u64) (column u64) (sink visitor) (buffer (pointer d:data))) result
+  (do
+    (d:resize buffer 0)
+    (let
+      ((quoted bool (== (byte-at source at) (char-code #\")))
+       (start u64 (match quoted (true (+ at 1)) (false at)))
+       (parsed result (field-at source start quoted false buffer)))
+      (match (field parsed status)
+        ((ok)
+         (let ((end u64 (field parsed offset)) (c u64 (byte-at source end)))
+           ; A bare CR is invalid outside quotes; check before publishing the field.
+           (match
+             (base:and
+               (== c (char-code #\return))
+               (base:not (== (byte-at source (+ end 1)) (char-code #\newline))))
+             (true (result (e:invalid) end))
+             (false
+               (let
+                 ((f (pointer (function ((pointer void) u64 u64 d:view) unit)) (field sink emit)))
+                 (do
+                   (f (field sink context) row column (d:borrow (deref buffer)))
+                   (base:cond
+                     ((== c end-of-input) (result (e:success) end))
+                     ((== c (char-code #\,)) (fields source (+ end 1) row (+ column 1) sink buffer))
+                     (true
+                       (let
+                         ((next
+                            u64
+                            (match (== c (char-code #\return)) (true (+ end 2)) (false (+ end 1)))))
+                         (match (== next (field source length))
+                           (true (result (e:success) next))
+                           (false (fields source next (+ row 1) 0 sink buffer))))))))))))
+        (_ parsed)))))
+
+;; Parse comma-separated UTF-8 fields. Callback views expire when the callback returns.
+(base:function parse ((source d:view) (backend a:backend) (sink visitor)) result
+  (match (s:validate source)
+    ((tuple false _) (result (e:invalid) 0))
+    ((tuple valid _)
+     (match (== (field source length) 0)
+       (true (result (e:success) 0))
+       (false
+         (let
+           ((buffer d:data (d:empty backend))
+            (parsed result (fields source 0 0 0 sink (address-of buffer))))
+           (do (d:destroy (address-of buffer)) parsed)))))))
+
+(base:function quote-at ((source d:view) (at u64) (out (pointer d:data))) unit
+  (match (== at (field source length))
+    (true (do (d:append out #\") unit))
+    (false
+      (let ((c u64 (byte-at source at)))
+        (do
+          (match (== c (char-code #\")) (true (do (d:append out #\") unit)) (false unit))
+          (d:append out (base:convert c))
+          (quote-at source (+ at 1) out))))))
+
+;; Always quote fields, doubling embedded quotes. Append delimiters separately.
+(base:function write-field ((source d:view) (out (pointer d:data))) e:status
+  (match (s:validate source)
+    ((tuple false _) (e:invalid))
+    ((tuple valid _)
+     (match (a:checked-multiply-size (field source length) 2)
+       ((tuple false _) (e:too-large))
+       ((tuple valid size)
+        (match (a:checked-add-size size 2)
+          ((tuple false _) (e:too-large))
+          ((tuple valid quoted)
+           (match (a:checked-add-size quoted (d:length (deref out)))
+             ((tuple false _) (e:too-large))
+             ((tuple valid capacity)
+              (match (d:reserve out capacity)
+                ((ok) (do (d:append out #\") (quote-at source 0 out) (e:success)))
+                (reason reason)))))))))))
+
+(base:function write-separator ((out (pointer d:data))) e:status
+  (d:append out #\,))
+
+(base:function write-record-end ((out (pointer d:data))) e:status
+  (match (a:checked-add-size (d:length (deref out)) 2)
+    ((tuple false _) (e:too-large))
+    ((tuple valid capacity)
+     (match (d:reserve out capacity)
+       ((ok) (do (d:append out #\return) (d:append out #\newline) (e:success)))
+       (reason reason)))))
+
+(export result visitor parse write-field write-separator write-record-end)
